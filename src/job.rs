@@ -313,12 +313,14 @@ fn run_job(req: JobRequest, st: SharedJob, cancel: CancelFlag) {
                 return;
             }
             log_line(&st, "Extraction du convertisseur…");
+            // NB : 7-Zip exige que la valeur du switch -o soit COLLÉE au switch
+            // (`-oC:\chemin` en un seul argument). Passé séparément (`-o`, chemin),
+            // 7z le lit comme un switch vide → « Command Line Error: Too short switch: -o ».
             let out = std::process::Command::new(&seven)
-                .arg("-y")
                 .arg("x")
+                .arg("-y")
                 .arg(&conv)
-                .arg("-o")
-                .arg(&work)
+                .arg(format!("-o{}", work.display()))
                 .output();
             match out {
                 Ok(o) if o.status.success() => {}
