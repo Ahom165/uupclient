@@ -333,6 +333,61 @@ fn ellipsize(s: &str, max: usize) -> String {
     }
 }
 
+/// Carte sobre : cadre arrondi, liseré discret, marge intérieure constante.
+/// Toutes les pages l'utilisent pour un même rythme visuel.
+fn card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    egui::Frame::new()
+        .stroke(stroke)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            // Pleine largeur : toutes les cartes d'une même page ont des
+            // bordures alignées (lecture verticale régulière).
+            ui.set_min_width(ui.available_width() - 1.0);
+            if !title.is_empty() {
+                ui.label(RichText::new(title).strong().small());
+                ui.add_space(2.0);
+            }
+            add(ui)
+        })
+        .inner
+}
+
+/// Bouton d'action principal : fond accent, texte blanc.
+fn primary(ui: &mut egui::Ui, label: &str, accent: Color32, enabled: bool) -> bool {
+    let btn = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE))
+        .fill(accent)
+        .min_size(egui::vec2(180.0, 30.0));
+    ui.add_enabled(enabled, btn).clicked()
+}
+
+/// Pied de page commun aux écrans de configuration : retour à gauche,
+/// action principale à droite. Renvoie Some(true) = action principale,
+/// Some(false) = retour, None = rien.
+fn footer(
+    ui: &mut egui::Ui,
+    back_label: &str,
+    next: Option<(&str, bool)>,
+    accent: Color32,
+) -> Option<bool> {
+    ui.separator();
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui.button(back_label).clicked() {
+            action = Some(false);
+        }
+        if let Some((label, enabled)) = next {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if primary(ui, label, accent, enabled) {
+                    action = Some(true);
+                }
+            });
+        }
+    });
+    action
+}
+
 fn valid_uuid(s: &str) -> bool {
     let base = s.split("_rev.").next().unwrap_or(s);
     let parts: Vec<&str> = base.split('-').collect();
@@ -522,10 +577,12 @@ impl App {
             // Texte lisible sur toute sélection (blanc sur bleu).
             s.visuals.selection.stroke.color = Color32::WHITE;
             s.visuals.hyperlink_color = accent;
+            // Rythme vertical homogène + boutons plus respirants.
+            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            s.spacing.button_padding = egui::vec2(10.0, 4.0);
         });
 
-        self.top_bar(ctx, accent);
-        self.side_rail(ctx);
+        self.header(ctx, accent);
         // Barre de recherche FIXE en haut (page Builds) : dessinée dans un
         // panneau dédié (TopBottomPanel), elle ne peut structurellement JAMAIS
         // défiler ni sortir de l'écran — quelles que soient la taille de la
@@ -547,53 +604,45 @@ impl App {
                 Page::Package => {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| self.page_package(ui))
+                        .show(ui, |ui| self.page_package(ui, accent))
                         .inner
                 }
                 Page::Options => {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| self.page_options(ui))
+                        .show(ui, |ui| self.page_options(ui, accent))
                         .inner
                 }
-                Page::Download => self.page_download(ui, accent),
+                Page::Download => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.page_download(ui, accent))
+                        .inner
+                }
             });
     }
 
-    fn top_bar(&mut self, ctx: &egui::Context, accent: Color32) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+    /// En-tête unique : titre + étapes 1-4 cliquables (pilules) + bascule de
+    /// thème, puis rappel discret de la sélection. Remplace l'ancienne barre
+    /// de titre ET le rail latéral : un seul niveau de chrome, contenu plus large.
+    fn header(&mut self, ctx: &egui::Context, accent: Color32) {
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new("UUP dump Client")
-                        .size(18.0)
+                        .size(16.0)
                         .strong()
                         .color(accent),
                 );
-                ui.label(RichText::new("· client natif léger").weak());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let icon = if self.dark { "☀" } else { "☾" };
-                    if ui.small_button(icon).clicked() {
-                        self.dark = !self.dark;
-                    }
-                });
-            });
-            ui.add_space(6.0);
-        });
-    }
-
-    fn side_rail(&mut self, ctx: &egui::Context) {
-        let step = self.page;
-        egui::SidePanel::left("rail")
-            .exact_width(168.0)
-            .show(ctx, |ui| {
-                ui.add_space(14.0);
+                ui.separator();
+                let step = self.page;
                 let has_sel = self.selected.is_some();
                 let has_pkg = !self.lang.is_empty() && !self.selected_editions.is_empty();
                 let items = [
                     (Page::Search, "1  Builds", true),
                     (Page::Package, "2  Package", has_sel),
-                    (Page::Options, "3  Options & drivers", has_sel),
+                    (Page::Options, "3  Options", has_sel),
                     (
                         Page::Download,
                         "4  Téléchargement",
@@ -601,37 +650,45 @@ impl App {
                     ),
                 ];
                 for (p, label, enabled) in items {
-                    let mut label = RichText::new(label);
-                    if p == step {
-                        label = label.strong();
-                    }
+                    let active = p == step;
+                    // Blanc explicite sur la pilule active (fond accent).
+                    let txt = if active {
+                        RichText::new(label).strong().color(Color32::WHITE)
+                    } else {
+                        RichText::new(label)
+                    };
                     let resp = ui.add_enabled(
-                        enabled || p == step,
-                        egui::Button::new(label)
-                            .fill(if p == step {
-                                egui::Color32::from_rgba_unmultiplied(96, 148, 214, 36)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            })
-                            .min_size(egui::vec2(150.0, 30.0)),
+                        enabled || active,
+                        egui::Button::new(txt)
+                            .fill(if active { accent } else { Color32::TRANSPARENT })
+                            .min_size(egui::vec2(0.0, 26.0)),
                     );
-                    if resp.clicked() {
+                    if resp.clicked() && p != step {
                         self.page = p;
                     }
-                    ui.add_space(4.0);
                 }
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Sélection").weak().small());
-                    if let Some(s) = &self.selected {
-                        ui.label(RichText::new(&s.build).strong());
-                        ui.label(RichText::new(&s.title).small());
-                        ui.label(RichText::new(&s.arch).weak().small());
-                    } else {
-                        ui.label(RichText::new("aucune").weak().small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let icon = if self.dark { "☀" } else { "☾" };
+                    if ui.small_button(icon).clicked() {
+                        self.dark = !self.dark;
                     }
                 });
             });
+            if let Some(s) = &self.selected {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Sélection :").weak().small());
+                    ui.label(
+                        RichText::new(format!("{} · {}", s.build, s.arch))
+                            .strong()
+                            .small(),
+                    );
+                    let maxc = ((ui.available_width() - 30.0) / 6.5).clamp(20.0, 110.0) as usize;
+                    ui.label(RichText::new(ellipsize(&s.title, maxc)).weak().small());
+                });
+            }
+            ui.add_space(6.0);
+        });
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context, accent: Color32) {
@@ -725,7 +782,9 @@ impl App {
         match self.mode {
             SearchMode::Known => {
                 let resp = ui.horizontal_wrapped(|ui| {
-                    ui.label("Recherche :");
+                    // Libellés alignés sur une même largeur : les champs de la
+                    // barre commencent tous au même endroit.
+                    ui.add_sized([76.0, 18.0], egui::Label::new("Recherche :"));
                     // Largeur responsive : le champ occupe l'espace restant
                     // (réservé pour le bouton) au lieu d'une largeur fixe qui
                     // débordait hors de l'écran sur les fenêtres étroites.
@@ -748,7 +807,7 @@ impl App {
             }
             SearchMode::Wu => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Canal :");
+                    ui.add_sized([76.0, 18.0], egui::Label::new("Canal :"));
                     for c in CHANNELS {
                         if ui
                             .selectable_label(self.cfg.channel == c.id, c.label)
@@ -761,7 +820,7 @@ impl App {
                 });
                 ui.add_space(6.0);
                 let resp = ui.horizontal_wrapped(|ui| {
-                    ui.label("Build :");
+                    ui.add_sized([76.0, 18.0], egui::Label::new("Build :"));
                     let w = field_w(ui, 150.0, 130.0, 260.0);
                     let r = ui.add_sized(
                         [w, 24.0],
@@ -777,7 +836,7 @@ impl App {
                 }
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Arch :");
+                    ui.add_sized([76.0, 18.0], egui::Label::new("Arch :"));
                     for a in ARCHES {
                         if ui.selectable_label(self.cfg.arch == a, a).clicked() {
                             self.cfg.arch = a.to_string();
@@ -792,7 +851,7 @@ impl App {
             }
             SearchMode::Direct => {
                 let resp = ui.horizontal_wrapped(|ui| {
-                    ui.label("Update ID :");
+                    ui.add_sized([76.0, 18.0], egui::Label::new("Update ID :"));
                     let w = field_w(ui, 150.0, 140.0, 460.0);
                     let r = ui.add_sized(
                         [w, 24.0],
@@ -879,26 +938,43 @@ impl App {
                             ui.end_row();
                             for b in &rows {
                                 let selected = sel_uuid.as_deref() == Some(b.uuid.as_str());
-                                ui.label(RichText::new(&b.build).strong().color(if selected {
-                                    Color32::from_rgb(96, 148, 214)
-                                } else {
-                                    ui.visuals().text_color()
-                                }));
+                                // Toute la ligne est cliquable (avant : seuls
+                                // les titres) — plus naturel à parcourir.
+                                let build_lbl = egui::Label::new(
+                                    RichText::new(&b.build).strong().color(if selected {
+                                        Color32::from_rgb(96, 148, 214)
+                                    } else {
+                                        ui.visuals().text_color()
+                                    }),
+                                )
+                                .sense(egui::Sense::click());
+                                let b_resp = ui.add(build_lbl);
                                 // Titre borné (ne pousse plus la grille hors
                                 // de l'écran) ; le titre complet au survol.
                                 let title =
                                     egui::Label::new(RichText::new(ellipsize(&b.title, max_chars)))
                                         .sense(egui::Sense::click());
                                 let t_resp = ui.add(title).on_hover_text(b.title.as_str());
-                                ui.label(&b.arch);
+                                let a_resp = ui.add(
+                                    egui::Label::new(RichText::new(&b.arch).weak())
+                                        .sense(egui::Sense::click()),
+                                );
                                 let date = if b.created > 0 {
                                     chrono_days_ago(b.created)
                                 } else {
                                     "—".into()
                                 };
-                                ui.label(RichText::new(date).weak());
+                                let d_resp = ui.add(
+                                    egui::Label::new(RichText::new(date).weak())
+                                        .sense(egui::Sense::click()),
+                                );
                                 ui.end_row();
-                                if t_resp.clicked() || t_resp.double_clicked() {
+                                if b_resp.clicked()
+                                    || t_resp.clicked()
+                                    || t_resp.double_clicked()
+                                    || a_resp.clicked()
+                                    || d_resp.clicked()
+                                {
                                     chosen = Some(b.uuid.clone());
                                 }
                             }
@@ -916,24 +992,11 @@ impl App {
 
     // --------------------------------------------------------------- page 2
 
-    fn page_package(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Configurer le package");
-        ui.add_space(6.0);
-
+    fn page_package(&mut self, ui: &mut egui::Ui, accent: Color32) {
+        // Rappel discret : l'en-tête affiche déjà build · arch · titre.
         if let Some(s) = &self.selected {
-            // Vertical + largeur bornée : le titre et l'UUID ne débordent plus
-            // de la fenêtre (le wrap est désactivé dans les rangées horizontales).
-            let maxc = ((ui.available_width() - 20.0) / 7.3).clamp(24.0, 90.0) as usize;
-            ui.add(egui::Label::new(
-                RichText::new(ellipsize(&s.title, maxc)).strong(),
-            ));
-            ui.label(
-                RichText::new(ellipsize(&format!("({})", s.uuid), 52))
-                    .weak()
-                    .small(),
-            );
+            ui.label(RichText::new(format!("Update : {}", s.uuid)).weak().small());
         }
-        ui.add_space(10.0);
 
         if self.loading_meta {
             ui.horizontal(|ui| {
@@ -944,162 +1007,162 @@ impl App {
         }
         // Les erreurs API (ex. rate-limit) doivent être visibles ici aussi,
         // avec un moyen de relancer — sinon l'écran reste sur « Chargement… ».
-        if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(Color32::from_rgb(224, 110, 110)));
-            if ui.button("Réessayer").clicked() {
-                self.load_meta();
-            }
+        if let Some(e) = self.error.clone() {
+            card(ui, "", |ui| {
+                ui.label(RichText::new(e).color(Color32::from_rgb(224, 110, 110)));
+                if ui.button("Réessayer").clicked() {
+                    self.load_meta();
+                }
+            });
             ui.add_space(8.0);
         }
 
         // Langue
-        ui.label(RichText::new("Langue").strong());
-        let no_langs = self
-            .langs
-            .as_ref()
-            .map(|l| l.list.is_empty())
-            .unwrap_or(false);
-        if no_langs {
-            ui.label(RichText::new(
-                "Aucune langue disponible pour cette update (packages .NET/arm64 par exemple). Choisissez une autre build — de préférence une « Feature Update ».",
-            ).weak());
-        } else if self.langs.is_some() && !self.loading_meta {
-            let lang_list: Vec<String> = self.langs.as_ref().unwrap().list.clone();
-            let lang_fancy: std::collections::HashMap<String, String> =
-                self.langs.as_ref().unwrap().fancy.clone();
-            let names: Vec<String> = lang_list
-                .iter()
-                .map(|c| {
-                    format!(
-                        "{} ({})",
-                        lang_fancy.get(c).cloned().unwrap_or_else(|| c.clone()),
-                        c
-                    )
-                })
-                .collect();
-            let mut idx = lang_list.iter().position(|c| *c == self.lang).unwrap_or(0);
-            ui.add_space(2.0);
-            egui::ComboBox::from_id_salt("langsel")
-                .selected_text(names.get(idx).cloned().unwrap_or_default())
-                .width(field_w(ui, 24.0, 200.0, 340.0))
-                .show_ui(ui, |ui| {
-                    for (i, n) in names.iter().enumerate() {
-                        ui.selectable_value(&mut idx, i, n.clone());
+        card(ui, "Langue", |ui| {
+            let no_langs = self
+                .langs
+                .as_ref()
+                .map(|l| l.list.is_empty())
+                .unwrap_or(false);
+            if no_langs {
+                ui.label(RichText::new(
+                    "Aucune langue disponible pour cette update (packages .NET/arm64 par exemple). Choisissez une autre build — de préférence une « Feature Update ».",
+                ).weak());
+            } else if self.langs.is_some() {
+                let lang_list: Vec<String> = self.langs.as_ref().unwrap().list.clone();
+                let lang_fancy: std::collections::HashMap<String, String> =
+                    self.langs.as_ref().unwrap().fancy.clone();
+                let names: Vec<String> = lang_list
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{} ({})",
+                            lang_fancy.get(c).cloned().unwrap_or_else(|| c.clone()),
+                            c
+                        )
+                    })
+                    .collect();
+                let mut idx = lang_list.iter().position(|c| *c == self.lang).unwrap_or(0);
+                egui::ComboBox::from_id_salt("langsel")
+                    .selected_text(names.get(idx).cloned().unwrap_or_default())
+                    .width(field_w(ui, 24.0, 200.0, 340.0))
+                    .show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            ui.selectable_value(&mut idx, i, n.clone());
+                        }
+                    });
+                if idx < lang_list.len() && lang_list[idx] != self.lang {
+                    self.lang = lang_list[idx].clone();
+                    self.cfg.last_lang = self.lang.clone();
+                    self.editions = None;
+                    self.selected_editions.clear();
+                    self.estimate = None;
+                    self.load_editions();
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Langues indisponibles.").weak());
+                    if ui.button("Charger").clicked() {
+                        self.load_meta();
                     }
                 });
-            if idx < lang_list.len() && lang_list[idx] != self.lang {
-                self.lang = lang_list[idx].clone();
-                self.cfg.last_lang = self.lang.clone();
-                self.editions = None;
-                self.selected_editions.clear();
-                self.estimate = None;
-                self.load_editions();
             }
-        } else if !self.loading_meta {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Langues indisponibles.").weak());
-                if ui.button("Charger").clicked() {
-                    self.load_meta();
-                }
-            });
-        }
+        });
+        ui.add_space(8.0);
 
-        ui.add_space(10.0);
-        ui.label(RichText::new("Éditions").strong());
-        if self.editions.is_some() {
-            let eds_list: Vec<String> = self.editions.as_ref().unwrap().list.clone();
-            let mut sorted: Vec<(String, String)> = eds_list
-                .iter()
-                .map(|c| (c.clone(), self.fancy_edition(c)))
-                .collect();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            ui.add_space(2.0);
-            egui::ScrollArea::vertical()
-                .max_height(240.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("eds")
-                        .num_columns(3)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for (code, fancy) in &sorted {
-                                let mut on = self.selected_editions.contains(code);
-                                if ui.checkbox(&mut on, format!("{fancy}  [{code}]")).changed() {
-                                    if on {
-                                        if !self.selected_editions.contains(code) {
-                                            self.selected_editions.push(code.clone());
+        // Éditions
+        card(ui, "Éditions", |ui| {
+            if self.editions.is_some() {
+                let eds_list: Vec<String> = self.editions.as_ref().unwrap().list.clone();
+                let mut sorted: Vec<(String, String)> = eds_list
+                    .iter()
+                    .map(|c| (c.clone(), self.fancy_edition(c)))
+                    .collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    // Hauteur adaptée au contenu (pas de grand vide) : seule
+                    // la largeur occupe toute la carte ; max 240 px.
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        egui::Grid::new("eds")
+                            .num_columns(3)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (code, fancy) in &sorted {
+                                    let mut on = self.selected_editions.contains(code);
+                                    if ui.checkbox(&mut on, format!("{fancy}  [{code}]")).changed()
+                                    {
+                                        if on {
+                                            if !self.selected_editions.contains(code) {
+                                                self.selected_editions.push(code.clone());
+                                            }
+                                        } else {
+                                            self.selected_editions.retain(|c| c != code);
                                         }
-                                    } else {
-                                        self.selected_editions.retain(|c| c != code);
                                     }
+                                    ui.end_row();
                                 }
-                                ui.end_row();
-                            }
-                        });
+                            });
+                    });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.small_button("Tout").clicked() {
+                        self.selected_editions = eds_list.clone();
+                    }
+                    if ui.small_button("Aucune").clicked() {
+                        self.selected_editions.clear();
+                    }
                 });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.small_button("Tout").clicked() {
-                    self.selected_editions = eds_list.clone();
+                // Hors de la rangée horizontale : le texte long se replie tout seul
+                // au lieu de sortir de l'écran.
+                ui.label(RichText::new("NB : l'API prend une seule édition par téléchargement ; « Tout » enchaîne sur la première. Les éditions virtuelles se choisissent à l'étape 3.").weak().small());
+            } else {
+                ui.label(RichText::new("Choisissez d'abord une langue.").weak());
+            }
+        });
+        ui.add_space(8.0);
+
+        // Estimation
+        card(ui, "Estimation", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Estimer la taille du téléchargement").clicked() && !self.estimate_busy
+                {
+                    self.estimate_size();
                 }
-                if ui.small_button("Aucune").clicked() {
-                    self.selected_editions.clear();
+                if self.estimate_busy {
+                    ui.spinner();
+                }
+                if let Some((name, bytes, n)) = &self.estimate {
+                    ui.label(
+                        RichText::new(format!("{name} — {n} fichiers — {}", human_size(*bytes)))
+                            .strong(),
+                    );
                 }
             });
-            // Hors de la rangée horizontale : le texte long se replie tout seul
-            // au lieu de sortir de l'écran.
-            ui.label(RichText::new("NB : l'API prend une seule édition par téléchargement ; « Tout » enchaîne sur la première. Les éditions virtuelles se choisissent à l'étape 3.").weak().small());
-        } else {
-            ui.label(RichText::new("Choisissez d'abord une langue.").weak());
-        }
+        });
 
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui.button("Estimer la taille du téléchargement").clicked() && !self.estimate_busy {
-                self.estimate_size();
-            }
-            if self.estimate_busy {
-                ui.spinner();
-            }
-            if let Some((name, bytes, n)) = &self.estimate {
-                ui.label(
-                    RichText::new(format!("{name} — {n} fichiers — {}", human_size(*bytes)))
-                        .strong(),
-                );
-            }
-        });
-
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            if ui.button("Retour aux builds").clicked() {
-                self.page = Page::Search;
-            }
-            let ok = self.selected.is_some()
-                && !self.lang.is_empty()
-                && !self.selected_editions.is_empty();
-            if ui
-                .add_enabled(
-                    ok,
-                    egui::Button::new(RichText::new("Continuer vers Options").strong()),
-                )
-                .clicked()
-            {
-                self.page = Page::Options;
-            }
-        });
+        let ok =
+            self.selected.is_some() && !self.lang.is_empty() && !self.selected_editions.is_empty();
+        match footer(
+            ui,
+            "Retour aux builds",
+            Some(("Continuer vers Options", ok)),
+            accent,
+        ) {
+            Some(false) => self.page = Page::Search,
+            Some(true) => self.page = Page::Options,
+            None => {}
+        }
     }
 
     // --------------------------------------------------------------- page 3
 
-    fn page_options(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Options du package & drivers");
-        ui.add_space(6.0);
-        let o = &mut self.cfg.options;
-
-        ui.group(|ui| {
-            ui.label(RichText::new("Destination").strong());
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
+    fn page_options(&mut self, ui: &mut egui::Ui, accent: Color32) {
+        // Destination
+        card(ui, "Destination", |ui| {
+            ui.horizontal_wrapped(|ui| {
                 let w = field_w(ui, 130.0, 160.0, 430.0);
                 ui.add_sized(
                     [w, 22.0],
@@ -1112,50 +1175,91 @@ impl App {
                 }
             });
         });
-
         ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.label(RichText::new("Création de l'ISO").strong());
-            ui.add_space(4.0);
-            ui.checkbox(&mut o.convert_iso, "Convertir en ISO à la fin du téléchargement (sinon : fichiers UUP seuls)");
+
+        // ISO & options de conversion — hiérarchie rendue par l'indentation :
+        // ISO → AddUpdates → Cleanup → ResetBase ; les autres options au 1er niveau.
+        card(ui, "Création de l'ISO", |ui| {
+            let o = &mut self.cfg.options;
+            ui.checkbox(
+                &mut o.convert_iso,
+                "Convertir en ISO à la fin du téléchargement (sinon : fichiers UUP seuls)",
+            );
             ui.add_enabled_ui(o.convert_iso, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Format :");
-                    ui.selectable_value(&mut o.compression, Compression::Wim, "install.wim (standard)");
-                    ui.selectable_value(&mut o.compression, Compression::Esd, "install.esd (plus compact)");
-                });
-                ui.checkbox(&mut o.add_updates, "Intégrer les mises à jour cumulatives (AddUpdates)");
-                ui.add_enabled_ui(o.add_updates, |ui| {
-                    ui.checkbox(&mut o.cleanup, "Nettoyage des composants obsolètes (Cleanup — l'« auto-clean » du média)");
-                    ui.add_enabled_ui(o.cleanup, |ui| {
-                        ui.checkbox(&mut o.reset_base, "ResetBase (encore plus compact, mais mises à jour non désinstallables)");
+                ui.indent("iso_opts", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Format :");
+                        ui.selectable_value(
+                            &mut o.compression,
+                            Compression::Wim,
+                            "install.wim (standard)",
+                        );
+                        ui.selectable_value(
+                            &mut o.compression,
+                            Compression::Esd,
+                            "install.esd (plus compact)",
+                        );
                     });
+                    ui.checkbox(
+                        &mut o.add_updates,
+                        "Intégrer les mises à jour cumulatives (AddUpdates)",
+                    );
+                    ui.add_enabled_ui(o.add_updates, |ui| {
+                        ui.indent("upd_opts", |ui| {
+                            ui.checkbox(
+                                &mut o.cleanup,
+                                "Nettoyage des composants obsolètes (Cleanup — l'« auto-clean » du média)",
+                            );
+                            ui.add_enabled_ui(o.cleanup, |ui| {
+                                ui.indent("cb_opts", |ui| {
+                                    ui.checkbox(
+                                        &mut o.reset_base,
+                                        "ResetBase (encore plus compact, mais mises à jour non désinstallables)",
+                                    );
+                                });
+                            });
+                        });
+                    });
+                    ui.checkbox(&mut o.netfx3, "Intégrer .NET Framework 3.5 (NetFx3)");
+                    ui.checkbox(
+                        &mut o.virtual_editions,
+                        "Créer les éditions virtuelles (Enterprise, Education…)",
+                    );
+                    ui.checkbox(&mut o.skip_edge, "Supprimer Microsoft Edge (SkipEdge)");
+                    ui.checkbox(&mut o.skip_winre, "Ne pas recréer winre.wim (SkipWinRE)");
+                    ui.checkbox(
+                        &mut o.auto_clean,
+                        "Auto-clean : supprimer les fichiers UUP temporaires après création de l'ISO",
+                    );
                 });
-                ui.checkbox(&mut o.netfx3, "Intégrer .NET Framework 3.5 (NetFx3)");
-                ui.checkbox(&mut o.virtual_editions, "Créer les éditions virtuelles (Enterprise, Education…)");
-                ui.checkbox(&mut o.skip_edge, "Supprimer Microsoft Edge (SkipEdge)");
-                ui.checkbox(&mut o.skip_winre, "Ne pas recréer winre.wim (SkipWinRE)");
-                ui.checkbox(&mut o.auto_clean, "Auto-clean : supprimer les fichiers UUP temporaires après création de l'ISO");
             });
         });
-
         ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.label(RichText::new("Drivers (injection dans l'ISO)").strong());
-            ui.add_space(2.0);
+
+        // Drivers
+        card(ui, "Drivers (injection dans l'ISO)", |ui| {
             ui.label(RichText::new(
                 "Ajoutez des dossiers contenant des fichiers .inf. Ils sont copiés dans le dossier Drivers/ du convertisseur officiel.",
             ).weak().small());
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             let mut to_remove: Option<usize> = None;
             let mut to_add: Option<(String, DriverTarget)> = None;
             for (i, d) in self.cfg.drivers.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    let w = field_w(ui, 330.0, 140.0, 340.0);
-                    let path_w = ui.add_sized([w, 20.0], egui::TextEdit::singleline(&mut d.path));
-                    if ui.selectable_value(&mut d.target, DriverTarget::All, "Toutes images").clicked() {}
-                    if ui.selectable_value(&mut d.target, DriverTarget::Os, "OS").clicked() {}
-                    if ui.selectable_value(&mut d.target, DriverTarget::WinPe, "WinPE").clicked() {}
+                ui.horizontal_wrapped(|ui| {
+                    let w = field_w(ui, 330.0, 140.0, 360.0);
+                    ui.add_sized([w, 20.0], egui::TextEdit::singleline(&mut d.path));
+                    if ui
+                        .selectable_value(&mut d.target, DriverTarget::All, "Toutes images")
+                        .clicked()
+                    {}
+                    if ui
+                        .selectable_value(&mut d.target, DriverTarget::Os, "OS")
+                        .clicked()
+                    {}
+                    if ui
+                        .selectable_value(&mut d.target, DriverTarget::WinPe, "WinPE")
+                        .clicked()
+                    {}
                     if ui.button("Dossier…").clicked() {
                         if let Some(p) = pick_folder() {
                             d.path = p;
@@ -1164,13 +1268,11 @@ impl App {
                     if ui.button("Retirer").clicked() {
                         to_remove = Some(i);
                     }
-                    let _ = path_w;
                 });
             }
             if let Some(i) = to_remove {
                 self.cfg.drivers.remove(i);
             }
-            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("+ Ajouter un dossier de drivers").clicked() {
                     if let Some(p) = pick_folder() {
@@ -1186,31 +1288,27 @@ impl App {
             }
         });
 
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            if ui.button("Retour au package").clicked() {
-                self.page = Page::Package;
-            }
-            if ui
-                .button(RichText::new("Lancer le téléchargement").strong())
-                .clicked()
-            {
-                self.start_job();
-            }
-        });
+        ui.add_space(12.0);
+        let ok = self.selected.is_some();
+        match footer(
+            ui,
+            "Retour au package",
+            Some(("Lancer le téléchargement", ok)),
+            accent,
+        ) {
+            Some(false) => self.page = Page::Package,
+            Some(true) => self.start_job(),
+            None => {}
+        }
     }
 
     // --------------------------------------------------------------- page 4
 
     fn page_download(&mut self, ui: &mut egui::Ui, accent: Color32) {
-        ui.heading("Téléchargement & création de l'ISO");
-        ui.add_space(6.0);
-
-        let (phase, done_f, done_b, tot_b, files_done, files_total, speed) = {
+        let (phase, done_b, tot_b, files_done, files_total, speed) = {
             let s = self.job.lock().unwrap();
             (
                 s.phase.clone(),
-                s.files_done,
                 s.bytes_done,
                 s.bytes_total,
                 s.files_done,
@@ -1218,12 +1316,11 @@ impl App {
                 s.speed_bps,
             )
         };
-        let _ = (done_f, files_done, files_total);
 
-        match &phase {
+        card(ui, "Progression", |ui| match &phase {
             Phase::Idle => {
                 ui.label("Aucun job en cours.");
-                if ui.button(RichText::new("Relancer").strong()).clicked() {
+                if primary(ui, "Relancer", accent, true) {
                     self.start_job();
                 }
             }
@@ -1233,13 +1330,16 @@ impl App {
                     let s = self.job.lock().unwrap();
                     (s.iso_path.clone(), s.work_dir.clone())
                 };
-                if let Some(iso) = iso {
-                    ui.label(format!("ISO : {iso}"));
+                if let Some(iso) = &iso {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("ISO :");
+                        ui.label(RichText::new(iso).strong());
+                    });
                 }
-                if let Some(w) = work.clone() {
-                    ui.label(RichText::new(format!("Dossier : {w}")).weak());
+                if let Some(w) = &work {
+                    ui.label(RichText::new(format!("Dossier : {w}")).weak().small());
                 }
-                ui.add_space(8.0);
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     if ui.button("Ouvrir le dossier").clicked() {
                         if let Some(w) = &work {
@@ -1264,13 +1364,14 @@ impl App {
                         .color(Color32::from_rgb(224, 96, 96))
                         .strong(),
                 );
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Réessayer").clicked() {
-                        self.start_job();
-                    }
                     if ui.button("Retour aux options").clicked() {
                         self.job_running = false;
                         self.page = Page::Options;
+                    }
+                    if primary(ui, "Réessayer", accent, true) {
+                        self.start_job();
                     }
                 });
             }
@@ -1286,12 +1387,11 @@ impl App {
                         }
                         Phase::Downloading => {
                             ui.label(format!(
-                                "Téléchargement : {}/{} fichiers — {} / {} ({}/s)",
+                                "Téléchargement : {}/{} fichiers — {} / {}",
                                 files_done,
                                 files_total,
                                 human_size(done_b),
-                                human_size(tot_b),
-                                human_size(speed)
+                                human_size(tot_b)
                             ));
                         }
                         Phase::Converting => {
@@ -1313,31 +1413,50 @@ impl App {
                         .show_percentage()
                         .desired_height(18.0),
                 );
-                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if speed > 0 {
+                        ui.label(RichText::new(format!("{}/s", human_size(speed))).weak());
+                    }
+                    if let Some(w) = self.job.lock().unwrap().work_dir.clone() {
+                        ui.separator();
+                        ui.label(RichText::new(w).weak().small());
+                    }
+                });
+                ui.add_space(2.0);
                 if ui.button("Annuler").clicked() {
                     self.cancel.store(true, Ordering::SeqCst);
                 }
             }
-        }
+        });
 
-        ui.add_space(10.0);
-        ui.label(RichText::new("Journal").strong());
+        ui.add_space(8.0);
+        // Journal — fond « terminal », colle au bas ; hauteur bornée pour que
+        // la page reste lisible même en fenêtre basse (la page défile).
+        ui.label(RichText::new("Journal").strong().small());
         let lines: Vec<String> = self.job.lock().unwrap().log.clone();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
+        egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
-                ui.set_min_height(240.0);
-                for l in lines
-                    .iter()
-                    .rev()
-                    .take(300)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                {
-                    ui.monospace(l);
-                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        ui.set_min_height(220.0);
+                        for l in lines
+                            .iter()
+                            .rev()
+                            .take(300)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                        {
+                            ui.monospace(RichText::new(l).small());
+                        }
+                    });
             });
     }
 }
