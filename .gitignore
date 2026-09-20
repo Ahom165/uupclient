@@ -1,0 +1,14 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Artefacts de build UUP (sortie locale de l'application)
+/UUPs/
+*.iso
+*.7z
+aria2c.exe
+uup_download_windows.cmd
+
+# Système
+.DS_Store
+Thumbs.db
