@@ -5,6 +5,9 @@ edition = "2021"
 description = "Client natif léger pour UUP dump : recherche de builds Windows, téléchargement des fichiers UUP, ajout de drivers et création d'ISO"
 license = "MIT"
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 eframe = "0.33"
 ureq = { version = "2", features = ["json", "gzip"] }
