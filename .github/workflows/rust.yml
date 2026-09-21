@@ -1,0 +1,47 @@
+name: Build Windows (exe + installeur)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'v*' ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-release-${{ hashFiles('Cargo.lock') }}
+
+      - name: Compiler (release)
+        run: cargo build --release
+
+      - name: Créer le dossier dist
+        run: New-Item -ItemType Directory -Force dist | Out-Null
+        shell: pwsh
+
+      - name: Construire l'installeur NSIS
+        run: makensis -DEXE_PATH="target\release\uupdump-client.exe" -DOUT_FILE="dist\uupdump-client-setup.exe" installer.nsi
+        shell: cmd
+
+      - name: Zip portable
+        run: Compress-Archive -Path target\release\uupdump-client.exe -DestinationPath dist\uupdump-client-portable-windows.zip -Force
+        shell: pwsh
+
+      - name: Publier les artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uupdump-client-windows
+          path: |
+            dist/uupdump-client-setup.exe
+            dist/uupdump-client-portable-windows.zip
