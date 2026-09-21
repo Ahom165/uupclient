@@ -30,6 +30,10 @@ jobs:
         run: New-Item -ItemType Directory -Force dist | Out-Null
         shell: pwsh
 
+      - name: Installer NSIS
+        run: choco install nsis -y --no-progress
+        shell: pwsh
+
       - name: Construire l'installeur NSIS
         run: makensis -DEXE_PATH="target\release\uupdump-client.exe" -DOUT_FILE="dist\uupdump-client-setup.exe" installer.nsi
         shell: cmd
