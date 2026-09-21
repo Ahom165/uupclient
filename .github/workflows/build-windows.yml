@@ -35,8 +35,10 @@ jobs:
         shell: pwsh
 
       - name: Construire l'installeur NSIS
-        run: makensis -DEXE_PATH="target\release\uupdump-client.exe" -DOUT_FILE="dist\uupdump-client-setup.exe" installer.nsi
-        shell: cmd
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files (x86)\NSIS;C:\Program Files\NSIS;$env:PATH"
+          makensis -DEXE_PATH="target\release\uupdump-client.exe" -DOUT_FILE="dist\uupdump-client-setup.exe" installer.nsi
 
       - name: Zip portable
         run: Compress-Archive -Path target\release\uupdump-client.exe -DestinationPath dist\uupdump-client-portable-windows.zip -Force
