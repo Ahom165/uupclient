@@ -18,11 +18,21 @@ const DIM: Color32 = Color32::from_rgb(0x8a, 0x8f, 0x94);
 
 pub fn render(ctx: &Context, app: &mut App) {
     header(ctx, app);
+    // Barre de recherche épinglée en haut (panneau fixe) : elle ne défile jamais
+    // avec les résultats, quelle que soit la hauteur de la liste.
+    if app.screen == Screen::Search {
+        search_bar_panel(ctx, app);
+    }
     if app.show_settings {
         settings_panel(ctx, app);
     }
+    // Barre d'action épinglée en bas de l'écran Détail : le bouton Télécharger
+    // reste visible même quand la liste des éditions déborde.
+    if app.screen == Screen::Detail && app.current_build().is_some() {
+        detail_action_panel(ctx, app);
+    }
     egui::CentralPanel::default().show(ctx, |ui| match app.screen {
-        Screen::Search => search_screen(ui, app),
+        Screen::Search => results_screen(ui, app),
         Screen::Detail => detail_screen(ui, app),
         Screen::Downloads => downloads_screen(ui, app),
         Screen::Finished => finished_screen(ui, app),
@@ -33,26 +43,31 @@ pub fn render(ctx: &Context, app: &mut App) {
 // ---------------------------------------------------------------- header
 
 fn header(ctx: &Context, app: &mut App) {
-    egui::TopBottomPanel::top("header").show(ctx, |ui| {
-        ui.add_space(6.0);
-        ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.strong(RichText::new("UUP dump Client").size(18.0));
-            ui.label(RichText::new("· client natif léger").color(DIM).small());
-            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .selectable_label(app.show_settings, RichText::new("⚙ Paramètres"))
-                    .clicked()
-                {
-                    app.show_settings = !app.show_settings;
-                }
-                if app.screen != Screen::Search && ui.button("← Rechercher").clicked() {
-                    app.back_to_search();
-                }
+    // exact_height : sans lui, egui 0.33 peut mémoriser une hauteur erronée pour
+    // le panneau dès la première interaction pointeur et l'écran "descend" alors
+    // à chaque repaint (panneau qui gonfle indéfiniment).
+    egui::TopBottomPanel::top("header")
+        .exact_height(42.0)
+        .show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.strong(RichText::new("UUP dump Client").size(18.0));
+                ui.label(RichText::new("· client natif léger").color(DIM).small());
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .selectable_label(app.show_settings, RichText::new("⚙ Paramètres"))
+                        .clicked()
+                    {
+                        app.show_settings = !app.show_settings;
+                    }
+                    if app.screen != Screen::Search && ui.button("← Rechercher").clicked() {
+                        app.back_to_search();
+                    }
+                });
             });
+            ui.add_space(5.0);
+            ui.separator();
         });
-        ui.add_space(6.0);
-        ui.separator();
-    });
 }
 
 // ---------------------------------------------------------------- paramètres
@@ -237,61 +252,65 @@ fn settings_panel(ctx: &Context, app: &mut App) {
 
 // ---------------------------------------------------------------- recherche
 
-fn search_screen(ui: &mut Ui, app: &mut App) {
-    ui.add_space(10.0);
-
-    // Barre de recherche
-    egui::Frame::new()
-        .corner_radius(CornerRadius::same(6))
-        .fill(Color32::from_additive_luminance(6))
-        .inner_margin(egui::Margin::same(10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let w = ui.available_width();
-                ui.add_sized(
-                    [w - 420.0, 26.0],
-                    egui::TextEdit::singleline(&mut app.query)
-                        .hint_text("N° de build ou mots-clés (ex. 26200, insider, server…)"),
+fn search_bar_panel(ctx: &Context, app: &mut App) {
+    egui::TopBottomPanel::top("search_bar")
+        .exact_height(72.0)
+        .show(ctx, |ui| {
+            ui.add_space(6.0);
+            egui::Frame::new()
+            .corner_radius(CornerRadius::same(6))
+            .fill(Color32::from_additive_luminance(6))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let w = ui.available_width();
+                    ui.add_sized(
+                        [w - 420.0, 26.0],
+                        egui::TextEdit::singleline(&mut app.query)
+                            .hint_text("N° de build ou mots-clés (ex. 26200, insider, server…)"),
+                    );
+                    ComboBox::from_id_salt("chan")
+                        .selected_text(channel_label(&app.settings.channel))
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for (code, label) in CHANNELS {
+                                ui.selectable_value(&mut app.settings.channel, code.to_string(), *label);
+                            }
+                        });
+                    ComboBox::from_id_salt("arch")
+                        .selected_text(app.settings.arch.clone())
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for a in ARCHS {
+                                ui.selectable_value(&mut app.settings.arch, a.to_string(), *a);
+                            }
+                        });
+                    if ui.button("Dernières du canal").clicked() {
+                        app.query.clear();
+                        app.save_settings();
+                        app.search();
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Rechercher").strong()).fill(ACCENT))
+                        .clicked()
+                    {
+                        app.save_settings();
+                        app.search();
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Champ vide + « Rechercher » = dernières builds toutes canaux confondus.",
+                    )
+                    .small()
+                    .color(DIM),
                 );
-                ComboBox::from_id_salt("chan")
-                    .selected_text(channel_label(&app.settings.channel))
-                    .width(130.0)
-                    .show_ui(ui, |ui| {
-                        for (code, label) in CHANNELS {
-                            ui.selectable_value(&mut app.settings.channel, code.to_string(), *label);
-                        }
-                    });
-                ComboBox::from_id_salt("arch")
-                    .selected_text(app.settings.arch.clone())
-                    .width(80.0)
-                    .show_ui(ui, |ui| {
-                        for a in ARCHS {
-                            ui.selectable_value(&mut app.settings.arch, a.to_string(), *a);
-                        }
-                    });
-                if ui.button("Dernières du canal").clicked() {
-                    app.query.clear();
-                    app.save_settings();
-                    app.search();
-                }
-                if ui
-                    .add(egui::Button::new(RichText::new("Rechercher").strong()).fill(ACCENT))
-                    .clicked()
-                {
-                    app.save_settings();
-                    app.search();
-                }
             });
-            ui.label(
-                RichText::new(
-                    "Champ vide + « Rechercher » = dernières builds toutes canaux confondus.",
-                )
-                .small()
-                .color(DIM),
-            );
-        });
+    });
+}
 
+fn results_screen(ui: &mut Ui, app: &mut App) {
     ui.add_space(8.0);
 
     if let Some(b) = &app.busy {
@@ -305,7 +324,10 @@ fn search_screen(ui: &mut Ui, app: &mut App) {
     }
 
     ui.strong(format!("{} build(s)", app.results.len()));
-    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    ScrollArea::vertical()
+        .id_salt("results")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
         let mut open_idx: Option<usize> = None;
         for (i, b) in app.results.iter().enumerate() {
             let sel = app.selected == Some(i);
@@ -389,86 +411,91 @@ fn detail_screen(ui: &mut Ui, app: &mut App) {
     );
     ui.separator();
 
-    // Mode
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut app.mode, DlMode::Full, "Set complet (ISO possible)");
-        ui.radio_value(&mut app.mode, DlMode::UpdatesOnly, "Mises à jour uniquement");
-    });
+    // Zone défilante : seul ce bloc bouge — le titre reste en haut et la
+    // barre d'action (bouton Télécharger) reste épinglée en bas de l'écran.
+    ScrollArea::vertical()
+        .id_salt("detail")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(2.0);
 
-    if let Some(b) = &app.busy {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(b);
-        });
-    }
-    if let Some(e) = &app.error {
-        ui.colored_label(ERR, format!("⚠ {e}"));
-    }
+            if let Some(b) = &app.busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(b);
+                });
+                ui.add_space(4.0);
+            }
+            if let Some(e) = &app.error {
+                ui.colored_label(ERR, format!("⚠ {e}"));
+                ui.add_space(4.0);
+            }
 
-    match app.mode {
-        DlMode::UpdatesOnly => {
-            ui.add_space(6.0);
-            ui.label(
-                "Télécharge uniquement les fichiers de mise à jour (cabinets/MSU) de cette build, sans image d'installation.",
-            );
-        }
-        DlMode::Full => {
-            ui.add_space(6.0);
+            // Mode
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut app.mode, DlMode::Full, "Set complet (ISO possible)");
+                ui.radio_value(&mut app.mode, DlMode::UpdatesOnly, "Mises à jour uniquement");
+            });
 
-            // Langue
-            ui.strong("Langue");
-            if let Some(langs) = &app.langs {
-                let sel = langs
-                    .get(app.lang_idx)
-                    .map(|l| format!("{} ({})", l.fancy, l.code))
-                    .unwrap_or_else(|| "—".into());
-                let mut new_idx: Option<usize> = None;
-                ComboBox::from_id_salt("lang")
-                    .selected_text(sel)
-                    .width(320.0)
-                    .show_ui(ui, |ui| {
-                        for (i, l) in langs.iter().enumerate() {
-                            if ui
-                                .selectable_label(i == app.lang_idx, format!("{} ({})", l.fancy, l.code))
-                                .clicked()
-                            {
-                                new_idx = Some(i);
+            match app.mode {
+                DlMode::UpdatesOnly => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        "Télécharge uniquement les fichiers de mise à jour (cabinets/MSU) de cette build, sans image d'installation.",
+                    );
+                }
+                DlMode::Full => {
+                    ui.add_space(6.0);
+
+                    // Langue
+                    ui.strong("Langue");
+                    if let Some(langs) = &app.langs {
+                        let sel = langs
+                            .get(app.lang_idx)
+                            .map(|l| format!("{} ({})", l.fancy, l.code))
+                            .unwrap_or_else(|| "—".into());
+                        let mut new_idx: Option<usize> = None;
+                        ComboBox::from_id_salt("lang")
+                            .selected_text(sel)
+                            .width(320.0)
+                            .show_ui(ui, |ui| {
+                                for (i, l) in langs.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(i == app.lang_idx, format!("{} ({})", l.fancy, l.code))
+                                        .clicked()
+                                    {
+                                        new_idx = Some(i);
+                                    }
+                                }
+                            });
+                        if let Some(i) = new_idx {
+                            app.lang_chosen(i);
+                        }
+                    } else {
+                        ui.label(RichText::new("Chargement des langues…").color(DIM));
+                    }
+
+                    ui.add_space(6.0);
+
+                    // Éditions (dans le défilement global, pas de scroll imbriqué)
+                    ui.strong("Éditions");
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Tout cocher").clicked() {
+                            for (_, on) in app.editions.iter_mut() {
+                                *on = true;
+                            }
+                        }
+                        if ui.small_button("Tout décocher").clicked() {
+                            for (_, on) in app.editions.iter_mut() {
+                                *on = false;
+                            }
+                        }
+                        if ui.small_button("Windows Pro").clicked() {
+                            for (e, on) in app.editions.iter_mut() {
+                                *on = e.key.eq_ignore_ascii_case("professional");
                             }
                         }
                     });
-                if let Some(i) = new_idx {
-                    app.lang_chosen(i);
-                }
-            } else {
-                ui.label(RichText::new("Chargement des langues…").color(DIM));
-            }
-
-            ui.add_space(6.0);
-
-            // Éditions
-            ui.strong("Éditions");
-            ui.horizontal(|ui| {
-                if ui.small_button("Tout cocher").clicked() {
-                    for (_, on) in app.editions.iter_mut() {
-                        *on = true;
-                    }
-                }
-                if ui.small_button("Tout décocher").clicked() {
-                    for (_, on) in app.editions.iter_mut() {
-                        *on = false;
-                    }
-                }
-                if ui.small_button("Windows Pro").clicked() {
-                    for (e, on) in app.editions.iter_mut() {
-                        *on = e.key.eq_ignore_ascii_case("professional");
-                    }
-                }
-            });
-            ScrollArea::vertical()
-                .id_salt("eds")
-                .auto_shrink([false, false])
-                .max_height(220.0)
-                .show(ui, |ui| {
                     let count = app.editions.len();
                     let cols = 3usize;
                     egui::Grid::new("edgrid")
@@ -491,43 +518,55 @@ fn detail_screen(ui: &mut Ui, app: &mut App) {
                                 ui.end_row();
                             }
                         });
-                });
-        }
-    }
+                }
+            }
+        });
+}
 
-    ui.add_space(12.0);
+/// Barre d'action de l'écran Détail : épinglée en bas (panneau fixe de hauteur
+/// exacte), le bouton Télécharger et le résumé restent toujours visibles.
+fn detail_action_panel(ctx: &Context, app: &mut App) {
+    egui::TopBottomPanel::bottom("detail_actions")
+        .exact_height(66.0)
+        .show(ctx, |ui| {
+            ui.separator();
+            ui.add_space(5.0);
 
-    // Résumé + action
-    let dest = app
-        .settings
-        .dest_dir
-        .clone()
-        .unwrap_or_else(|| "destination non définie".into());
-    ui.label(
-        RichText::new(format!(
-            "Destination : {} · {} driver(s) · ISO : {} · auto-clean : {}",
-            dest,
-            app.settings.drivers.len(),
-            if app.settings.options.make_iso { "oui" } else { "non" },
-            if app.settings.options.cleanup { "oui" } else { "non" },
-        ))
-        .small()
-        .color(DIM),
-    );
+            let dest = app
+            .settings
+            .dest_dir
+            .clone()
+            .unwrap_or_else(|| "destination non définie".into());
+        ui.label(
+            RichText::new(format!(
+                "Destination : {} · {} driver(s) · ISO : {} · auto-clean : {}",
+                dest,
+                app.settings.drivers.len(),
+                if app.settings.options.make_iso { "oui" } else { "non" },
+                if app.settings.options.cleanup { "oui" } else { "non" },
+            ))
+            .small()
+            .color(DIM),
+        );
 
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        let can = app.busy.is_none();
-        let label = match app.mode {
-            DlMode::Full => "Télécharger les fichiers UUP",
-            DlMode::UpdatesOnly => "Télécharger les mises à jour",
-        };
-        if ui
-            .add_enabled(can, egui::Button::new(RichText::new(label).strong().size(15.0)).fill(ACCENT))
-            .clicked()
-        {
-            app.start_download();
-        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let can = app.busy.is_none();
+            let label = match app.mode {
+                DlMode::Full => "Télécharger les fichiers UUP",
+                DlMode::UpdatesOnly => "Télécharger les mises à jour",
+            };
+            if ui
+                .add_enabled(
+                    can,
+                    egui::Button::new(RichText::new(label).strong().size(15.0)).fill(ACCENT),
+                )
+                .clicked()
+            {
+                app.start_download();
+            }
+        });
+        ui.add_space(4.0);
     });
 }
 
@@ -702,22 +741,44 @@ fn show_build_logs(ui: &mut Ui, app: &mut App) {
 // ---------------------------------------------------------------- journal
 
 fn bottom_log(ctx: &Context, app: &mut App) {
-    egui::TopBottomPanel::bottom("logbar").show(ctx, |ui| {
-        ui.collapsing(RichText::new(format!("Journal — {}", last_log(&app.logs))).small(), |ui| {
-            ScrollArea::vertical()
-                .id_salt("applogs")
-                .max_height(160.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for l in &app.logs {
+    // Panneau à hauteur exacte (repli ou déplié) : immunisé contre le bug de
+    // mémoire de panneau d'egui 0.33 qui gonfle les panneaux interagis.
+    egui::TopBottomPanel::bottom("logbar")
+        .exact_height(if app.show_log { 196.0 } else { 28.0 })
+        .show(ctx, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let arrow = if app.show_log { "▾" } else { "▸" };
+                if ui
+                    .small_button(RichText::new(format!("{arrow} Journal")).small())
+                    .clicked()
+                {
+                    app.show_log = !app.show_log;
+                }
+                if !app.show_log {
+                    if let Some(l) = app.logs.back() {
                         ui.add(
-                            Label::new(RichText::new(l).small().monospace())
-                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            Label::new(RichText::new(l).small().color(DIM))
+                                .wrap_mode(egui::TextWrapMode::Truncate),
                         );
                     }
-                });
+                }
+            });
+            if app.show_log {
+                ScrollArea::vertical()
+                    .id_salt("applogs")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for l in &app.logs {
+                            ui.add(
+                                Label::new(RichText::new(l).small().monospace())
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        }
+                    });
+            }
         });
-    });
 }
 
 fn last_log(logs: &std::collections::VecDeque<String>) -> String {

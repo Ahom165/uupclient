@@ -45,6 +45,7 @@ pub struct App {
     pub settings: Settings,
     pub screen: Screen,
     pub show_settings: bool,
+    pub show_log: bool,
 
     // Recherche
     pub query: String,
@@ -165,6 +166,7 @@ impl App {
             settings,
             screen: Screen::Search,
             show_settings: false,
+            show_log: false,
             query: String::new(),
             results: Vec::new(),
             selected: None,
@@ -219,7 +221,21 @@ impl App {
         let ring = self.settings.channel.clone();
         std::thread::spawn(move || {
             let res = if q.is_empty() {
-                api.fetch_channel(&arch, &ring)
+                match api.fetch_channel(&arch, &ring) {
+                    Ok(v) if !v.is_empty() => Ok(v),
+                    _ => {
+                        // fetchupd (json-api) renvoie parfois NO_UPDATE_FOUND sans
+                        // terme de recherche : repli sur listid trié par date,
+                        // filtré sur l'architecture choisie.
+                        let mut v = api.search("").unwrap_or_default();
+                        v.retain(|b| b.arch == arch);
+                        if v.is_empty() {
+                            api.search("")
+                        } else {
+                            Ok(v)
+                        }
+                    }
+                }
             } else {
                 api.search(&q)
             };
@@ -529,7 +545,13 @@ impl App {
                                 v.insert(0, item);
                                 self.lang_idx = 0;
                             }
+                            // Auto-chargement des éditions pour la langue
+                            // présélectionnée (l'utilisateur peut changer après).
+                            let has_langs = !v.is_empty();
                             self.langs = Some(v);
+                            if has_langs {
+                                self.lang_chosen(self.lang_idx);
+                            }
                         }
                         Err(e) => {
                             self.error = Some(e);
