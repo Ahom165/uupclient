@@ -1,483 +1,451 @@
-//! Client pour l'API JSON de UUP dump (api.uupdump.net).
+//! Client pour l'API JSON publique d'UUP dump (https://api.uupdump.net).
 //!
-//! Endpoints validés contre l'API réelle (voir research/ dans le dépôt du projet) :
-//! - fetchupd.php      : arch, ring, build, flight, sku   -> dernières builds depuis Windows Update
-//! - listid.php        : search, sortByDate              -> base de données des builds connues (recherche du site)
-//! - listlangs.php     : id                              -> langues disponibles pour une update
-//! - listeditions.php  : lang, id                        -> éditions disponibles pour une langue
-//! - get.php           : id, lang, edition, noLinks      -> liste de fichiers + URLs directes + SHA-256
+//! Endpoints utilisés (validés en production) :
+//!   - listid.php       : recherche de builds (mots-clés / tri par date)
+//!   - fetchupd.php     : dernière build d'un canal (canary, dev, beta, rp, retail)
+//!   - listlangs.php    : langues disponibles pour une build
+//!   - listeditions.php : éditions disponibles pour une build + langue
+//!   - get.php          : liste des fichiers avec URLs de téléchargement signées
 //!
-//! Toutes les réponses sont enveloppées dans { "response": ..., "jsonApiVersion": ... }.
-//! Erreurs notables : USER_RATE_LIMITED (HTTP 429), NO_UPDATE_FOUND, UNSUPPORTED_COMBINATION.
+//! Toutes les réponses sont enveloppées : {"response": {...}, "jsonApiVersion": "..."}.
+//! Une erreur applicative donne {"response": {"error": "CODE"}} avec HTTP 400/500.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::time::Duration;
 
+use serde_json::Value;
+
+use crate::models::{Build, EditionEntry, FileEntry, LangEntry};
+
 pub const API_BASE: &str = "https://api.uupdump.net";
-/// Package du convertisseur officiel (Windows) hébergé par uupdump.net.
-pub const CONVERTER_7Z_URL: &str = "https://uupdump.net/misc/uup-converter-wimlib-v126.7z";
-pub const CONVERTER_7Z_SHA256: &str =
-    "1448f7e33353fa63d558333c4b6ddb8b41b992a7911f19d3b72ba3246cf349bc";
-/// Extraction 7z sous Windows (fourni par uupdump).
-pub const SEVEN_ZR_URL: &str = "https://uupdump.net/misc/7zr.exe";
-pub const SEVEN_ZR_SHA256: &str =
-    "72c98287b2e8f85ea7bb87834b6ce1ce7ce7f41a8c97a81b307d4d4bf900922b";
-/// aria2c.exe pour Windows (accélère fortement les téléchargements).
-pub const ARIA2C_URL: &str = "https://uupdump.net/misc/aria2c.exe";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuildEntry {
-    pub title: String,
-    pub build: String,
-    pub arch: String,
-    pub created: i64,
-    pub uuid: String,
-}
+/// Canaux proposés dans l'interface.
+pub const CHANNELS: &[(&str, &str)] = &[
+    ("canary", "Canary"),
+    ("dev", "Dev"),
+    ("beta", "Beta"),
+    ("rp", "Release Preview"),
+    ("retail", "Retail"),
+];
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UpdateCandidate {
-    pub update_id: String,
-    pub title: String,
-    pub build: String,
-    pub arch: String,
-}
+/// Architectures proposées dans l'interface.
+pub const ARCHS: &[&str] = &["amd64", "arm64", "x86"];
 
-#[derive(Debug, Clone)]
-pub struct Langs {
-    pub list: Vec<String>,
-    pub fancy: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Editions {
-    pub list: Vec<String>,
-    pub fancy: HashMap<String, String>,
-}
-
-/// Désérialisation tolérante : l'API renvoie parfois les nombres sous forme de chaînes.
-fn de_i64_flexible<'de, D>(d: D) -> Result<i64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum V {
-        I(i64),
-        F(f64),
-        S(String),
-    }
-    match V::deserialize(d) {
-        Ok(V::I(i)) => Ok(i),
-        Ok(V::F(f)) => Ok(f as i64),
-        Ok(V::S(s)) => s.trim().parse::<i64>().map_err(serde::de::Error::custom),
-        Err(e) => Err(e),
-    }
-}
-
-/// Désérialise une map nom→texte en acceptant `[]` (tableau vide) : l'API
-/// renvoie un tableau vide au lieu d'un objet quand il n'y a aucune entrée
-/// (ex. langFancyNames pour une update sans langues).
-fn de_map_flexible<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let v = serde_json::Value::deserialize(d)?;
-    match v {
-        serde_json::Value::Object(m) => Ok(m
-            .into_iter()
-            .filter_map(|(k, x)| x.as_str().map(|s| (k, s.to_string())))
-            .collect()),
-        // L'API renvoie [] (tableau vide) au lieu d'un objet quand il n'y a
-        // aucune entrée (ex. langFancyNames d'une update sans langues).
-        _ => Ok(HashMap::new()),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileInfo {
-    #[serde(default)]
-    pub sha1: String,
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default, deserialize_with = "de_i64_flexible")]
-    pub size: i64,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub uuid: String,
-    #[serde(default, deserialize_with = "de_i64_flexible")]
-    pub expire: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PackageFiles {
-    pub update_name: String,
-    pub arch: String,
-    pub build: String,
-    pub files: HashMap<String, FileInfo>,
-}
-
+/// Erreur haute niveau avec message utilisateur en français.
 #[derive(Debug)]
-pub enum ApiError {
-    /// HTTP 429 : trop de requêtes, réessayer dans quelques secondes.
-    RateLimited,
-    /// Erreur renvoyée par l'API (NO_UPDATE_FOUND, UNSUPPORTED_COMBINATION, ...).
-    Api(String),
-    /// Problème réseau / HTTP.
-    Http(String),
-    /// Réponse inattendue.
-    Parse(String),
+pub struct ApiError {
+    pub message: String,
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::RateLimited => write!(
-                f,
-                "Trop de requêtes vers UUP dump (limite de débit). Réessayez dans quelques secondes."
-            ),
-            ApiError::Api(e) => {
-                if let Some(msg) = friendly_api_error(e) {
-                    write!(f, "{msg}")
-                } else {
-                    write!(f, "Erreur API UUP dump : {e}")
-                }
-            }
-            ApiError::Http(e) => write!(f, "Erreur réseau : {e}"),
-            ApiError::Parse(e) => write!(f, "Réponse illisible : {e}"),
-        }
+        write!(f, "{}", self.message)
     }
 }
 
-/// Traduction des codes d'erreur connus de l'API en messages utilisables.
-fn friendly_api_error(code: &str) -> Option<&'static str> {
+impl std::error::Error for ApiError {}
+
+fn err(msg: impl Into<String>) -> ApiError {
+    ApiError { message: msg.into() }
+}
+
+/// Traduit un code d'erreur UUP dump en message français (utilisé aussi par le builder).
+pub fn api_translate(code: &str) -> String {
+    translate_error(code)
+}
+
+/// Traduit un code d'erreur de l'API en message français compréhensible.
+fn translate_error(code: &str) -> String {
     match code {
-        "NO_UPDATE_FOUND" => Some(
-            "Aucune build trouvée pour cette combinaison canal / arch / numéro. En canal Retail, indiquez un numéro précis (ex. 19045 ou 26100) ; « latest » ne s'applique qu'aux canaux Insider (Dev, Beta, Canary).",
-        ),
         "UNSUPPORTED_COMBINATION" => {
-            Some("Combinaison canal / arch / build non supportée par Windows Update.")
+            "Cette build n'est pas (encore) disponible avec cette combinaison langue/édition côté serveur. Réessaie plus tard ou choisis une autre build.".into()
         }
-        "ILLEGAL_BUILD" => Some("Numéro de build invalide (minimum 6256)."),
-        "UNKNOWN_RING" => Some("Canal inconnu."),
-        "UNKNOWN_ARCH" => Some("Architecture inconnue."),
-        "NOT_FOUND" | "UPDATE_NOT_FOUND" => Some("Identifiant d'update introuvable sur UUP dump."),
-        _ => None,
+        "UNSUPPORTED_LANG" => "Langue non supportée pour cette build.".into(),
+        "INCORRECT_ID" => "Identifiant d'update invalide.".into(),
+        "UNSPECIFIED_UPDATE" => "Aucune update spécifiée.".into(),
+        "MISSING_FILES" => "Des fichiers manquent côté serveur Windows Update.".into(),
+        "NOT_CUMULATIVE_UPDATE" => "Cette update n'est pas une mise à jour cumulative.".into(),
+        "EMPTY_FILELIST" => "Liste de fichiers vide côté Windows Update.".into(),
+        "WU_REQUEST_FAILED" => "La requête vers les serveurs Windows Update a échoué.".into(),
+        "USER_RATE_LIMITED" => "Trop de requêtes vers UUP dump, patiente une minute avant de réessayer.".into(),
+        other => {
+            let _ = other;
+            format!("Erreur UUP dump : {}", code)
+        }
     }
 }
 
-/// Délai avant nouvelle tentative après un 429 (l'API limite à ~1 requête/10 s
-/// pour une ressource différente de la précédente).
-const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(6);
+/// Client HTTP avec retry automatique sur les erreurs temporaires (429/5xx/réseau).
+#[derive(Clone)]
+pub struct ApiClient {
+    agent: ureq::Agent,
+}
 
-fn get_json<T: for<'de> Deserialize<'de>>(path: &str, query: &str) -> Result<T, ApiError> {
-    // L'API limite le débit par IP : on réessaie automatiquement quelques fois.
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match get_json_once(path, query) {
-            Err(ApiError::RateLimited) if attempt < 4 => {
-                std::thread::sleep(RATE_LIMIT_BACKOFF);
+impl Default for ApiClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApiClient {
+    pub fn new() -> Self {
+        let mut agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout(Duration::from_secs(180))
+            .user_agent("uupdump-client-rs/0.1 (client natif)")
+            .build();
+        // gzip déjà actif via la feature "gzip" de ureq ; agent utilisé pour toutes les requêtes
+        let _ = &mut agent;
+        Self { agent }
+    }
+
+    /// GET JSON avec retry (jusqu'à 4 tentatives, backoff croissant).
+    fn get_json(&self, url: &str) -> Result<Value, ApiError> {
+        let mut last_err = String::new();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(2u64.pow(attempt as u32).min(30)));
             }
-            other => return other,
-        }
-    }
-}
-
-fn get_json_once<T: for<'de> Deserialize<'de>>(path: &str, query: &str) -> Result<T, ApiError> {
-    let agent: ureq::Agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout(Duration::from_secs(180))
-        .user_agent("uupdump-client-rs/0.1")
-        .build();
-
-    let url = format!("{API_BASE}/{path}?{query}");
-    let text = match agent.get(&url).call() {
-        Ok(r) => r.into_string().map_err(|e| ApiError::Http(e.to_string()))?,
-        Err(ureq::Error::Status(429, _)) => return Err(ApiError::RateLimited),
-        Err(ureq::Error::Status(code, resp)) => {
-            // L'API renvoie souvent un JSON exploitable avec un code 4xx/5xx
-            // ({"response":{"error":"NO_UPDATE_FOUND"}}). On parse en Value
-            // brut : une struct T dont tous les champs sont default
-            // désérialiserait ce corps en Data et masquerait l'erreur.
-            let body = resp.into_string().unwrap_or_default();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(e) = extract_error(&v) {
-                    return Err(e);
+            let resp = self
+                .agent
+                .get(url)
+                .call();
+            match resp {
+                Ok(r) => {
+                    let mut body = String::new();
+                    r.into_reader()
+                        .take(64 * 1024 * 1024)
+                        .read_to_string(&mut body)
+                        .map_err(|e| err(format!("Lecture de la réponse : {e}")))?;
+                    let v: Value = serde_json::from_str(&body)
+                        .map_err(|e| err(format!("Réponse illisible ({e})")))?;
+                    return Ok(v);
+                }
+                Err(ureq::Error::Status(code, r)) => {
+                    // L'API renvoie 400/500 avec un corps JSON contenant l'erreur : on le lit quand même.
+                    let mut body = String::new();
+                    let _ = r.into_reader().take(4 * 1024 * 1024).read_to_string(&mut body);
+                    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        if let Some(e) = v.pointer("/response/error").and_then(|x| x.as_str()) {
+                            return Err(err(translate_error(e)));
+                        }
+                    }
+                    last_err = format!("HTTP {code}");
+                    if code == 429 || code >= 500 {
+                        continue; // temporaire -> retry
+                    }
+                    return Err(err(format!("Le serveur a répondu {code}")));
+                }
+                Err(e) => {
+                    last_err = format!("{e}");
+                    continue; // réseau -> retry
                 }
             }
-            return Err(ApiError::Http(format!("HTTP {code}")));
         }
-        Err(e) => return Err(ApiError::Http(e.to_string())),
-    };
-
-    // Chemin nominal : détecter aussi une erreur embarquée dans un 200.
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| ApiError::Parse(e.to_string()))?;
-    if let Some(e) = extract_error(&v) {
-        return Err(e);
-    }
-    let data_v = v
-        .get("response")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    serde_json::from_value(data_v).map_err(|e| ApiError::Parse(e.to_string()))
-}
-
-/// Extrait l'erreur API d'une enveloppe {"response":{"error": …}} si présente.
-fn extract_error(v: &serde_json::Value) -> Option<ApiError> {
-    let err = v.get("response")?.get("error")?.as_str()?.to_string();
-    Some(if err == "USER_RATE_LIMITED" {
-        ApiError::RateLimited
-    } else {
-        ApiError::Api(err)
-    })
-}
-
-/// Recherche dans la base des builds connues — c'est la recherche "Tout parcourir" du site.
-///
-/// NOTE : avec `search`, l'API renvoie `builds` sous forme d'objet indexé
-/// ({"builds": {"18": {...}}}) ; sans recherche, c'est un tableau. On accepte les deux.
-pub fn list_ids(search: &str, sort_by_date: bool) -> Result<Vec<BuildEntry>, ApiError> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum BuildsField {
-        Array(Vec<serde_json::Value>),
-        Map(BTreeMap<String, serde_json::Value>),
-    }
-    #[derive(Deserialize)]
-    struct Resp {
-        builds: BuildsField,
+        Err(err(format!("Requête impossible après plusieurs essais ({last_err})")))
     }
 
-    let mut query = String::new();
-    if !search.is_empty() {
-        query.push_str("search=");
-        query.push_str(&percent_encode(search));
-        query.push('&');
-    }
-    query.push_str(&format!("sortByDate={}", if sort_by_date { 1 } else { 0 }));
-
-    let r: Resp = get_json("listid.php", &query)?;
-    // Décodage entrée par entrée : une entrée malformée est ignorée au lieu de faire
-    // échouer toute la réponse (certaines entrées historiques de la base sont douteuses).
-    let raw: Vec<serde_json::Value> = match r.builds {
-        BuildsField::Array(v) => v,
-        BuildsField::Map(m) => m.into_values().collect(),
-    };
-    let mut out: Vec<BuildEntry> = raw
-        .into_iter()
-        .filter_map(|v| serde_json::from_value::<BuildEntry>(v).ok())
-        .collect();
-    if sort_by_date {
-        out.sort_by(|a, b| b.created.cmp(&a.created));
-    }
-    Ok(out)
-}
-
-/// Récupère les dernières builds directement depuis Windows Update.
-/// `ring` : canary | dev | beta | rp | retail  —  `build` : "latest" | "26100" | "26100.1742"
-pub fn fetch_upd(arch: &str, ring: &str, build: &str) -> Result<Vec<UpdateCandidate>, ApiError> {
-    #[derive(Deserialize)]
-    struct Resp {
-        #[serde(rename = "updateId", default)]
-        update_id: String,
-        #[serde(rename = "updateTitle", default)]
-        update_title: String,
-        #[serde(rename = "foundBuild", default)]
-        found_build: String,
-        #[serde(default)]
-        arch: String,
-        #[serde(rename = "updateArray", default)]
-        update_array: Vec<RawUpdate>,
-    }
-    #[derive(Deserialize)]
-    struct RawUpdate {
-        #[serde(rename = "updateId")]
-        update_id: String,
-        #[serde(rename = "updateTitle")]
-        update_title: String,
-        #[serde(rename = "foundBuild")]
-        found_build: String,
-        #[serde(default)]
-        arch: String,
-    }
-
-    let query = format!(
-        "arch={}&ring={}&build={}&flight=Active&sku=48",
-        percent_encode(arch),
-        percent_encode(ring),
-        percent_encode(build)
-    );
-    let r: Resp = get_json("fetchupd.php", &query)?;
-
-    let mut out: Vec<UpdateCandidate> = r
-        .update_array
-        .into_iter()
-        .map(|u| UpdateCandidate {
-            update_id: u.update_id,
-            title: u.update_title,
-            build: u.found_build,
-            arch: if u.arch.is_empty() {
-                arch.to_string()
-            } else {
-                u.arch
-            },
-        })
-        .collect();
-    if out.is_empty() && !r.update_id.is_empty() {
-        out.push(UpdateCandidate {
-            update_id: r.update_id,
-            title: r.update_title,
-            build: r.found_build,
-            arch: if r.arch.is_empty() {
-                arch.to_string()
-            } else {
-                r.arch
-            },
-        });
-    }
-    Ok(out)
-}
-
-/// Langues disponibles pour une update.
-pub fn list_langs(id: &str) -> Result<Langs, ApiError> {
-    #[derive(Deserialize)]
-    struct Resp {
-        #[serde(rename = "langList", default)]
-        lang_list: Vec<String>,
-        #[serde(
-            rename = "langFancyNames",
-            default,
-            deserialize_with = "de_map_flexible"
-        )]
-        lang_fancy: HashMap<String, String>,
-    }
-    let r: Resp = get_json("listlangs.php", &format!("id={}", percent_encode(id)))?;
-    Ok(Langs {
-        list: r.lang_list,
-        fancy: r.lang_fancy,
-    })
-}
-
-/// Éditions disponibles pour une update + langue.
-pub fn list_editions(lang: &str, id: &str) -> Result<Editions, ApiError> {
-    #[derive(Deserialize)]
-    struct Resp {
-        #[serde(rename = "editionList", default)]
-        edition_list: Vec<String>,
-        #[serde(
-            rename = "editionFancyNames",
-            default,
-            deserialize_with = "de_map_flexible"
-        )]
-        edition_fancy: HashMap<String, String>,
-    }
-    let query = format!("lang={}&id={}", percent_encode(lang), percent_encode(id));
-    let r: Resp = get_json("listeditions.php", &query)?;
-    Ok(Editions {
-        list: r.edition_list,
-        fancy: r.edition_fancy,
-    })
-}
-
-/// Liste des fichiers d'un package. `edition` = nom d'édition ("PROFESSIONAL") ou "0" (toutes).
-pub fn get_files(id: &str, lang: &str, edition: &str) -> Result<PackageFiles, ApiError> {
-    #[derive(Deserialize)]
-    struct Resp {
-        #[serde(rename = "updateName", default)]
-        update_name: String,
-        #[serde(default)]
-        arch: String,
-        #[serde(default)]
-        build: String,
-        #[serde(default)]
-        files: BTreeMap<String, serde_json::Value>,
-    }
-    let query = format!(
-        "id={}&lang={}&edition={}",
-        percent_encode(id),
-        percent_encode(lang),
-        percent_encode(edition)
-    );
-    let r: Resp = get_json("get.php", &query)?;
-    // Décodage tolérant fichier par fichier (les entrées défectueuses sont ignorées).
-    let files: HashMap<String, FileInfo> = r
-        .files
-        .into_iter()
-        .filter_map(|(k, v)| serde_json::from_value::<FileInfo>(v).ok().map(|fi| (k, fi)))
-        .collect();
-    Ok(PackageFiles {
-        update_name: r.update_name,
-        arch: r.arch,
-        build: r.build,
-        files,
-    })
-}
-
-/// Encodage minimaliste pour query string (les UUID/titres ne contiennent pas de caractères exotiques,
-/// mais on encode proprement au cas où).
-pub fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'+' => {
-                out.push(b as char)
+    /// Extrait la liste des builds d'une réponse listid/fetchupd.
+    /// Le champ "builds" peut être un tableau (fetchupd) ou un objet indexé (listid/search).
+    fn parse_builds(v: &Value) -> Vec<Build> {
+        let mut out = Vec::new();
+        let Some(builds) = v.pointer("/response/builds") else {
+            return out;
+        };
+        match builds {
+            Value::Array(arr) => {
+                for b in arr {
+                    if let Some(build) = parse_one_build(b) {
+                        out.push(build);
+                    }
+                }
             }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
+            Value::Object(map) => {
+                for (_, b) in map {
+                    if let Some(build) = parse_one_build(b) {
+                        out.push(build);
+                    }
+                }
+            }
+            _ => {}
         }
+        out.sort_by(|a, b| b.created.cmp(&a.created).then(a.title.cmp(&b.title)));
+        out
     }
-    out
+
+    /// Recherche de builds par mot-clé (n° de build, "insider", "server"...).
+    pub fn search(&self, query: &str) -> Result<Vec<Build>, ApiError> {
+        let q: String = query.trim().replace(' ', "+");
+        let url = if q.is_empty() {
+            format!("{API_BASE}/listid.php?sortByDate=1")
+        } else {
+            format!("{API_BASE}/listid.php?search={q}&sortByDate=1")
+        };
+        let v = self.get_json(&url)?;
+        Ok(Self::parse_builds(&v))
+    }
+
+    /// Récupère la (les) dernière(s) build d'un canal pour une architecture.
+    pub fn fetch_channel(&self, arch: &str, ring: &str) -> Result<Vec<Build>, ApiError> {
+        let url = format!("{API_BASE}/fetchupd.php?arch={arch}&ring={ring}");
+        let v = self.get_json(&url)?;
+        Ok(Self::parse_builds(&v))
+    }
+
+    /// Langues disponibles pour une build.
+    pub fn list_langs(&self, update_id: &str) -> Result<Vec<LangEntry>, ApiError> {
+        let url = format!("{API_BASE}/listlangs.php?id={update_id}");
+        let v = self.get_json(&url)?;
+        let resp = &v["response"];
+        if let Some(e) = resp.get("error").and_then(|x| x.as_str()) {
+            return Err(err(translate_error(e)));
+        }
+        let mut out = Vec::new();
+        let fancy: BTreeMap<String, String> = resp
+            .get("langFancyNames")
+            .and_then(|x| x.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(list) = resp.get("langList").and_then(|x| x.as_array()) {
+            for code in list {
+                if let Some(code) = code.as_str() {
+                    let label = fancy
+                        .get(code)
+                        .cloned()
+                        .unwrap_or_else(|| prettify_lang(code));
+                    out.push(LangEntry {
+                        code: code.to_string(),
+                        fancy: label,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.fancy.to_lowercase().cmp(&b.fancy.to_lowercase()));
+        Ok(out)
+    }
+
+    /// Éditions disponibles pour une build + langue.
+    pub fn list_editions(&self, update_id: &str, lang: &str) -> Result<Vec<EditionEntry>, ApiError> {
+        let url = format!("{API_BASE}/listeditions.php?id={update_id}&lang={lang}");
+        let v = self.get_json(&url)?;
+        let resp = &v["response"];
+        if let Some(e) = resp.get("error").and_then(|x| x.as_str()) {
+            return Err(err(translate_error(e)));
+        }
+        let mut out = Vec::new();
+        let fancy: BTreeMap<String, String> = resp
+            .get("editionFancyNames")
+            .and_then(|x| x.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(list) = resp.get("editionList").and_then(|x| x.as_array()) {
+            for ed in list {
+                if let Some(key) = ed.as_str() {
+                    let label = fancy
+                        .get(key)
+                        .cloned()
+                        .unwrap_or_else(|| key.to_string());
+                    out.push(EditionEntry {
+                        key: key.to_string(),
+                        fancy: label,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.fancy.to_lowercase().cmp(&b.fancy.to_lowercase()));
+        Ok(out)
+    }
+
+    /// Liste des fichiers pour une build + langue + éditions (fusion de plusieurs appels).
+    /// `edition = None` avec `lang = None` => UPDATEONLY (mises à jour seules).
+    pub fn get_files(
+        &self,
+        update_id: &str,
+        lang: Option<&str>,
+        editions: &[String],
+    ) -> Result<(String, Vec<FileEntry>), ApiError> {
+        let mut merged: BTreeMap<String, FileEntry> = BTreeMap::new();
+        let mut update_name = String::new();
+
+        let targets: Vec<(Option<&str>, Option<&str>)> = if lang.is_none() {
+            vec![(None, Some("UPDATEONLY"))]
+        } else if editions.is_empty() {
+            vec![(lang, None)]
+        } else {
+            editions.iter().map(|e| (lang, Some(e.as_str()))).collect()
+        };
+
+        for (lang_p, ed_p) in targets {
+            let mut url = format!("{API_BASE}/get.php?id={update_id}");
+            if let Some(l) = lang_p {
+                url.push_str(&format!("&lang={l}"));
+            }
+            if let Some(e) = ed_p {
+                url.push_str(&format!("&edition={e}"));
+            }
+            let v = self.get_json(&url)?;
+            let resp = &v["response"];
+            if let Some(e) = resp.get("error").and_then(|x| x.as_str()) {
+                return Err(err(translate_error(e)));
+            }
+            if update_name.is_empty() {
+                update_name = resp
+                    .get("updateName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("Update")
+                    .to_string();
+            }
+            if let Some(files) = resp.get("files").and_then(|x| x.as_object()) {
+                for (name, meta) in files {
+                    let entry = FileEntry {
+                        name: name.clone(),
+                        sha1: meta.get("sha1").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        sha256: meta.get("sha256").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        size: meta
+                            .get("size")
+                            .and_then(|x| x.as_str().map(|s| s.to_string()).or_else(|| x.as_i64().map(|i| i.to_string())))
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0),
+                        url: meta.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        expire: meta.get("expire").and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64())).unwrap_or(0),
+                    };
+                    // Fusion : dédoublonnage par nom (les éditions partagent la majorité des fichiers)
+                    merged.entry(entry.name.clone()).or_insert(entry);
+                }
+            }
+        }
+
+        let files: Vec<FileEntry> = merged.into_values().collect();
+        if files.is_empty() {
+            return Err(err("Aucun fichier retourné pour cette sélection."));
+        }
+        Ok((update_name, files))
+    }
+}
+
+fn parse_one_build(v: &Value) -> Option<Build> {
+    Some(Build {
+        title: v.get("title")?.as_str()?.to_string(),
+        build: v.get("build")?.as_str()?.to_string(),
+        arch: v.get("arch")?.as_str()?.to_string(),
+        created: v.get("created")?.as_i64()?,
+        uuid: v.get("uuid")?.as_str()?.to_string(),
+    })
+}
+
+/// "fr-fr" -> "Français (France)" pour les codes les plus courants (fallback si l'API
+/// ne fournit pas de nom fantaisiste).
+fn prettify_lang(code: &str) -> String {
+    let map: &[(&str, &str)] = &[
+        ("fr-fr", "Français (France)"),
+        ("fr-ca", "Français (Canada)"),
+        ("en-us", "Anglais (États-Unis)"),
+        ("en-gb", "Anglais (Royaume-Uni)"),
+        ("de-de", "Allemand"),
+        ("es-es", "Espagnol (Espagne)"),
+        ("es-mx", "Espagnol (Mexique)"),
+        ("it-it", "Italien"),
+        ("pt-br", "Portugais (Brésil)"),
+        ("pt-pt", "Portugais (Portugal)"),
+        ("nl-nl", "Néerlandais"),
+        ("ru-ru", "Russe"),
+        ("pl-pl", "Polonais"),
+        ("zh-cn", "Chinois simplifié"),
+        ("zh-tw", "Chinois traditionnel"),
+        ("ja-jp", "Japonais"),
+        ("ko-kr", "Coréen"),
+        ("ar-sa", "Arabe"),
+        ("he-il", "Hébreu"),
+        ("neutral", "Neutre"),
+    ];
+    map.iter()
+        .find(|(k, _)| *k == code.to_lowercase())
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_else(|| code.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Test réseau réel : lancer avec `cargo test -- --ignored`
     #[test]
-    #[ignore]
-    fn listid_search_works() {
-        let r = list_ids("26100", true).expect("API call");
-        assert!(!r.is_empty());
-        assert!(r.iter().any(|b| b.build.starts_with("26100")));
+    fn parse_builds_object_shape() {
+        let v: Value = serde_json::json!({
+            "response": {"builds": {"1": {"title":"T","build":"1.0","arch":"amd64","created":10,"uuid":"u"}}}
+        });
+        let b = ApiClient::parse_builds(&v);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].uuid, "u");
+        assert_eq!(b[0].arch, "amd64");
     }
 
     #[test]
-    #[ignore]
-    fn get_files_works() {
-        // Feature update Windows 11 connue (vue lors de la recherche API).
-        std::thread::sleep(Duration::from_secs(4));
-        let r = get_files(
-            "d7cd226f-dc7e-4edf-b2ec-bbffc7b975a0",
-            "fr-fr",
-            "PROFESSIONAL",
-        )
-        .expect("get files");
-        assert!(!r.files.is_empty());
-        assert!(r.files.values().any(|f| !f.url.is_empty()));
+    fn parse_builds_array_shape() {
+        let v: Value = serde_json::json!({
+            "response": {"builds": [{"title":"T2","build":"2.0","arch":"arm64","created":20,"uuid":"u2"}]}
+        });
+        let b = ApiClient::parse_builds(&v);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].build, "2.0");
     }
 
     #[test]
+    fn lang_prettify() {
+        assert_eq!(prettify_lang("fr-fr"), "Français (France)");
+        assert_eq!(prettify_lang("neutral"), "Neutre");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// Tests réseau réels : cargo test -- --ignored
+    #[test]
     #[ignore]
-    fn langs_and_editions_work() {
-        let ids = list_ids("feature update", true).expect("search");
-        let id = &ids[0].uuid;
-        std::thread::sleep(Duration::from_secs(4));
-        let langs = list_langs(id).expect("langs");
-        assert!(!langs.list.is_empty());
-        if let Some(l) = langs.list.first() {
-            let eds = list_editions(l, id).expect("editions");
-            assert!(!eds.list.is_empty() || eds.list.is_empty());
+    fn live_search_and_files() {
+        let api = ApiClient::new();
+        let builds = api.search("Windows 11 Insider Preview").expect("recherche");
+        assert!(!builds.is_empty(), "aucune build insider");
+        // Trouve une build qui expose des langues (les KB n'en ont pas).
+        let mut chosen: Option<(Build, Vec<LangEntry>)> = None;
+        for b in builds.iter().take(6) {
+            if let Ok(langs) = api.list_langs(&b.uuid) {
+                if !langs.is_empty() {
+                    chosen = Some((b.clone(), langs));
+                    break;
+                }
+            }
         }
-    }
-
-    #[test]
-    fn percent_encode_basic() {
-        assert_eq!(percent_encode("fr-fr"), "fr-fr");
-        assert_eq!(percent_encode("a b"), "a+b");
-        assert_eq!(percent_encode("a&b"), "a%26b");
+        let Some((b, langs)) = chosen else {
+            panic!("aucune build avec langues trouvée");
+        };
+        assert!(!b.uuid.is_empty());
+        let fr = langs
+            .iter()
+            .find(|l| l.code == "fr-fr")
+            .cloned()
+            .or_else(|| langs.first().cloned())
+            .expect("aucune langue");
+        let eds = api.list_editions(&b.uuid, &fr.code).expect("éditions");
+        if eds.is_empty() {
+            eprintln!("(pas d'éditions pour cette build — ok pour un KB)");
+            return;
+        }
+        let (name, files) = api
+            .get_files(&b.uuid, Some(&fr.code), &[eds[0].key.clone()])
+            .expect("fichiers");
+        assert!(!files.is_empty());
+        assert!(files.iter().all(|f| !f.url.is_empty()));
+        eprintln!("OK : {name} → {} fichiers", files.len());
     }
 }
